@@ -1,0 +1,279 @@
+#!/bin/zsh
+# cellar — run the Windows build of Excel on macOS inside a private Wine bottle.
+#
+# The bottle reuses the Wine 11 runtime that Recall (Overwatch2Mac) ships, so a Mac
+# that can already run Overwatch can run Excel with no extra Wine download.
+
+set -euo pipefail
+
+CELLAR_ROOT="${CELLAR_ROOT:-$HOME/Library/Application Support/Cellar}"
+PREFIX="$CELLAR_ROOT/prefix"
+RUNTIME="$CELLAR_ROOT/runtime"
+LOGDIR="$CELLAR_ROOT/logs"
+SELF="${0:A}"
+REPO_DIR="${SELF:h:h}"
+
+RECALL_TARBALL="/Applications/Recall.app/Contents/Resources/runtime.tar.gz"
+OW2MAC_DIR="$HOME/Library/Application Support/Overwatch2Mac"
+
+WINE="$RUNTIME/bin/wine"
+export WINEPREFIX="$PREFIX"
+export WINEARCH=win64
+export WINELOADER="$WINE"
+export WINESERVER="$RUNTIME/bin/wineserver"
+export WINEMSYNC=1
+export WINEDEBUG="${WINEDEBUG:--all}"
+
+mkdir -p "$LOGDIR"
+
+say()  { print -P "%F{magenta}cellar%f $*"; }
+warn() { print -P "%F{yellow}cellar%f $*" >&2; }
+die()  { print -P "%F{red}cellar%f $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+cellar — Windows Excel on your Mac, via Wine
+
+  cellar setup                 Create the Windows bottle (runs once, safe to re-run)
+  cellar install <installer>   Run an Office installer: setup.exe, .iso, .img, or a folder
+                               Add a configuration .xml to run it as an Office Deployment Tool job
+  cellar run [file ...]        Open Excel, optionally with .xlsx/.xls/.csv files
+  cellar app                   Build Cellar.app in ~/Applications (Dock, Finder "Open With")
+  cellar display retina|normal Sharp 2x text on Retina screens, or 1x for external monitors
+  cellar exec <program> [args] Run any other Windows program in the bottle
+  cellar winecfg               Open Wine's settings for the bottle
+  cellar stop                  Force-quit everything running in the bottle
+  cellar status                Print ready / no-excel / no-bottle (used by Cellar.app)
+  cellar doctor                Show what's installed and where
+EOF
+}
+
+# ---------- runtime ----------
+
+find_runtime() {
+  [[ -x "$WINE" ]] && return 0
+
+  # 1. The runtime Recall already unpacked for Overwatch.
+  local active=""
+  if [[ -f "$OW2MAC_DIR/state.json" ]]; then
+    active=$(/usr/bin/plutil -extract active_runtime raw -o - "$OW2MAC_DIR/state.json" 2>/dev/null || true)
+  fi
+  if [[ -n "$active" && -x "$OW2MAC_DIR/runtimes/$active/bin/wine" ]]; then
+    say "Copying Recall's Wine runtime ($active)…"
+    /usr/bin/ditto "$OW2MAC_DIR/runtimes/$active" "$RUNTIME"
+    return 0
+  fi
+
+  # 2. The tarball inside Recall.app, if Overwatch setup was never run.
+  if [[ -f "$RECALL_TARBALL" ]]; then
+    say "Unpacking Wine runtime from Recall.app…"
+    mkdir -p "$RUNTIME"
+    /usr/bin/tar -xzf "$RECALL_TARBALL" -C "$RUNTIME"
+    return 0
+  fi
+
+  # 3. Any other Wine on PATH (Homebrew wine-stable, Gcenx builds, …).
+  local system_wine
+  system_wine=$(command -v wine64 || command -v wine || true)
+  if [[ -n "$system_wine" ]]; then
+    system_wine="${system_wine:A}"
+    say "Using Wine from ${system_wine:h}"
+    mkdir -p "$RUNTIME/bin"
+    ln -sf "$system_wine" "$RUNTIME/bin/wine"
+    ln -sf "${system_wine:h}/wineserver" "$RUNTIME/bin/wineserver"
+    return 0
+  fi
+
+  die "No Wine runtime found. Install Recall (Overwatch2Mac) or 'brew install --cask wine-stable', then re-run 'cellar setup'."
+}
+
+check_rosetta() {
+  /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null && return 0
+  die "Rosetta 2 is required. Install it with: softwareupdate --install-rosetta --agree-to-license"
+}
+
+wine_bg() {
+  # Detach so Finder/AppleScript callers return immediately.
+  nohup "$WINE" "$@" >>"$LOGDIR/wine.log" 2>&1 &!
+}
+
+# Mac path -> Windows path on Wine's Z: drive (Z: maps to /).
+winpath() { print -r -- "Z:${1:A:gs#/#\\}"; }
+
+# ---------- registry ----------
+
+import_reg() {
+  local reg="$LOGDIR/import-$$.reg"
+  print -r -- "REGEDIT4" > "$reg"
+  print -r -- "" >> "$reg"
+  cat >> "$reg"
+  "$WINE" regedit /S "$(winpath "$reg")" >>"$LOGDIR/wine.log" 2>&1
+  rm -f "$reg"
+}
+
+apply_office_tweaks() {
+  import_reg <<'EOF'
+[HKEY_CURRENT_USER\Software\Wine\Mac Driver]
+"LeftCommandIsCtrl"="y"
+
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"FontSmoothing"="2"
+"FontSmoothingType"=dword:00000002
+"FontSmoothingGamma"=dword:00000578
+"FontSmoothingOrientation"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\Graphics]
+"DisableHardwareAcceleration"=dword:00000001
+"DisableAnimations"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Common\General]
+"ShownFirstRunOptin"=dword:00000001
+EOF
+}
+
+set_display() {
+  local mode="$1" retina dpi
+  case "$mode" in
+    retina) retina=y; dpi=000000c0 ;;
+    normal) retina=n; dpi=00000060 ;;
+    *) die "display mode must be 'retina' or 'normal'" ;;
+  esac
+  import_reg <<EOF
+[HKEY_CURRENT_USER\\Software\\Wine\\Mac Driver]
+"RetinaMode"="$retina"
+
+[HKEY_CURRENT_USER\\Control Panel\\Desktop]
+"LogPixels"=dword:$dpi
+
+[HKEY_CURRENT_USER\\Software\\Wine\\Fonts]
+"LogPixels"=dword:$dpi
+
+[HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Hardware Profiles\\Current\\Software\\Fonts]
+"LogPixels"=dword:$dpi
+EOF
+  say "Display set to $mode. Restart Excel to see it."
+}
+
+# ---------- excel ----------
+
+find_excel() {
+  local dir
+  for dir in "$PREFIX/drive_c/Program Files/Microsoft Office" "$PREFIX/drive_c/Program Files (x86)/Microsoft Office"; do
+    [[ -d "$dir" ]] || continue
+    /usr/bin/find "$dir" -maxdepth 4 -iname 'EXCEL.EXE' -print -quit 2>/dev/null
+  done | head -n 1
+}
+
+cmd_setup() {
+  check_rosetta
+  find_runtime
+  # Keep a copy of the tools next to the bottle so Cellar.app works without the repo.
+  if [[ "$REPO_DIR" != "$CELLAR_ROOT" ]]; then
+    /usr/bin/ditto "$REPO_DIR/bin" "$CELLAR_ROOT/bin"
+    /usr/bin/ditto "$REPO_DIR/launcher" "$CELLAR_ROOT/launcher"
+  fi
+  local version
+  version=$("$WINE" --version)
+  if [[ ! -f "$PREFIX/system.reg" ]]; then
+    say "Creating the Windows bottle with $version (about 10 seconds)…"
+    # Skip the Mono/Gecko download prompts; Office doesn't use them.
+    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot --init >>"$LOGDIR/wine.log" 2>&1
+    "$WINESERVER" -w
+  else
+    say "Bottle already exists ($version)."
+  fi
+  say "Applying Office and macOS tweaks…"
+  apply_office_tweaks
+  set_display retina
+  "$WINESERVER" -w
+  say "Done. Next: cellar install /path/to/your/Office/setup.exe"
+}
+
+cmd_install() {
+  (( $# >= 1 )) || die "usage: cellar install <setup.exe | .iso | .img | folder> [configuration.xml]"
+  [[ -f "$PREFIX/system.reg" ]] || cmd_setup
+  local src="${1:A}" config="${2:-}" setup="" mounted=""
+
+  case "${src:e:l}" in
+    iso|img|dmg)
+      say "Mounting ${src:t}…"
+      mounted=$(/usr/bin/hdiutil attach -nobrowse -readonly "$src" 2>/dev/null | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+      [[ -n "$mounted" ]] || die "Couldn't mount $src"
+      setup="$mounted/setup.exe"
+      ;;
+    exe) setup="$src" ;;
+    *)   [[ -d "$src" ]] && setup="$src/setup.exe" ;;
+  esac
+  [[ -f "$setup" ]] || die "No setup.exe found at $src"
+
+  local -a args=()
+  if [[ -n "$config" ]]; then
+    args=(/configure "$(winpath "$config")")
+    say "Running Office Deployment Tool job ${config:t}…"
+  else
+    say "Starting the Office installer. Follow its windows; this can take a while."
+  fi
+
+  # Office setup copies its payload from the setup folder, so run from there.
+  (cd "${setup:h}" && "$WINE" "$(winpath "$setup")" "${args[@]}" >>"$LOGDIR/install.log" 2>&1) || warn "Installer exited with an error (see $LOGDIR/install.log)"
+  "$WINESERVER" -w || true
+  [[ -n "$mounted" ]] && /usr/bin/hdiutil detach -quiet "$mounted" || true
+
+  local excel
+  excel=$(find_excel)
+  if [[ -n "$excel" ]]; then
+    say "Excel installed at ${excel#$PREFIX/drive_c/}"
+    say "Open it with: cellar run   (or build the app: cellar app)"
+  else
+    warn "EXCEL.EXE wasn't found after the installer finished. Check $LOGDIR/install.log"
+    return 1
+  fi
+}
+
+cmd_run() {
+  local excel
+  excel=$(find_excel)
+  [[ -n "$excel" ]] || die "Excel isn't installed yet. Run: cellar install /path/to/setup.exe"
+  local -a files=()
+  local f
+  for f in "$@"; do files+=("$(winpath "$f")"); done
+  wine_bg "$(winpath "$excel")" "${files[@]}"
+}
+
+cmd_status() {
+  if [[ ! -x "$WINE" || ! -f "$PREFIX/system.reg" ]]; then print no-bottle
+  elif [[ -z "$(find_excel)" ]]; then print no-excel
+  else print ready
+  fi
+}
+
+cmd_doctor() {
+  print "Root:     $CELLAR_ROOT"
+  print "Rosetta:  $(/usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null && print ok || print MISSING)"
+  print "Runtime:  $([[ -x "$WINE" ]] && "$WINE" --version || print 'not set up')"
+  print "Bottle:   $([[ -f "$PREFIX/system.reg" ]] && print "$PREFIX" || print 'not created')"
+  local excel; excel=$(find_excel)
+  print "Excel:    ${excel:-not installed}"
+  print "App:      $([[ -d "$HOME/Applications/Cellar.app" ]] && print "$HOME/Applications/Cellar.app" || print 'not built (cellar app)')"
+  print "Logs:     $LOGDIR"
+}
+
+cmd_app() {
+  [[ -x "$CELLAR_ROOT/launcher/build-app.sh" ]] || die "Run 'cellar setup' first."
+  "$CELLAR_ROOT/launcher/build-app.sh"
+}
+
+case "${1:-help}" in
+  setup)    shift; cmd_setup ;;
+  install)  shift; cmd_install "$@" ;;
+  run)      shift; cmd_run "$@" ;;
+  app)      shift; cmd_app ;;
+  display)  shift; set_display "${1:-}" ;;
+  exec)     shift; (( $# )) || die "usage: cellar exec <program> [args]"; wine_bg "$@" ;;
+  winecfg)  wine_bg winecfg ;;
+  stop)     "$WINESERVER" -k 2>/dev/null || true; say "Stopped." ;;
+  status)   cmd_status ;;
+  doctor)   cmd_doctor ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

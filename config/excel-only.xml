@@ -1,0 +1,36 @@
+<!--
+  Office Deployment Tool job: 32-bit Excel only, nothing else.
+  Use with:  cellar install /path/to/setup.exe config/excel-only.xml
+
+  Product ID depends on your licence:
+    O365ProPlusRetail   Microsoft 365 Apps for business / enterprise
+    O365HomePremRetail  Microsoft 365 Personal / Family
+    Excel2021Retail     Excel 2021 (one-time purchase)
+    ExcelRetail         Excel 2016 (one-time purchase)
+  The ExcludeApp lines only matter for the suite IDs; standalone Excel IDs ignore them.
+
+  32-bit is deliberate: the 64-bit Office installer usually fails under Wine.
+  Updates are off so a background update can't swap in a build that breaks under Wine.
+  The installer still shows Microsoft's licence terms for you to accept.
+-->
+<Configuration>
+  <Add OfficeClientEdition="32" Channel="Current">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="MatchOS" Fallback="en-us" />
+      <ExcludeApp ID="Access" />
+      <ExcludeApp ID="Bing" />
+      <ExcludeApp ID="Groove" />
+      <ExcludeApp ID="Lync" />
+      <ExcludeApp ID="OneDrive" />
+      <ExcludeApp ID="OneNote" />
+      <ExcludeApp ID="Outlook" />
+      <ExcludeApp ID="OutlookForWindows" />
+      <ExcludeApp ID="PowerPoint" />
+      <ExcludeApp ID="Publisher" />
+      <ExcludeApp ID="Teams" />
+      <ExcludeApp ID="Word" />
+    </Product>
+  </Add>
+  <Updates Enabled="FALSE" />
+  <Display Level="Full" AcceptEULA="FALSE" />
+</Configuration>
